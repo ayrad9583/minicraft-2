@@ -1,119 +1,116 @@
+// Petit serveur WebSocket + Express pour servir le jeu et gérer les salons
 const express = require('express');
 const http = require('http');
-const { createHash } = require('crypto');
-const path = require('path');
+const WebSocket = require('ws');
+const { v4: uuidv4 } = require('uuid');
+
 const app = express();
+// servir les fichiers statiques du dépôt (index.html à la racine)
+app.use(express.static('.'));
+
 const server = http.createServer(app);
-const io = require('socket.io')(server, { cors: { origin: '*' } });
+const wss = new WebSocket.Server({ server });
 
-// Serve repository files (allow serving index.html from repo root)
-app.use(express.static(path.join(__dirname)));
+const rooms = new Map(); // roomId => Set of ws clients
+const clientMeta = new Map(); // ws => {room, playerId, name}
 
-// In-memory lobby store
-const lobbies = new Map(); // id -> { id, name, hostId, passwordHash|null, maxPlayers, public, players: Map(socketId->meta) }
-
-function hashPassword(pw) {
-  return pw ? createHash('sha256').update(pw).digest('hex') : null;
+function broadcastToRoom(roomId, message, exceptWs = null) {
+  const s = rooms.get(roomId);
+  if (!s) return;
+  const data = JSON.stringify(message);
+  for (const c of s) {
+    if (c.readyState === WebSocket.OPEN && c !== exceptWs) c.send(data);
+  }
 }
-function makeLobbyId() { return Math.random().toString(36).slice(2, 9); }
-function getPublicLobbies() {
+
+function send(ws, message) {
+  if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(message));
+}
+
+function listRooms() {
   const res = [];
-  for (const [id, l] of lobbies) {
-    if (l.public) res.push({ id: l.id, name: l.name, players: l.players.size, maxPlayers: l.maxPlayers });
+  for (const [id, set] of rooms.entries()) {
+    res.push({ id, players: set.size });
   }
   return res;
 }
 
-io.on('connection', (socket) => {
-  console.log('socket connected', socket.id);
+wss.on('connection', (ws) => {
+  const playerId = uuidv4();
+  clientMeta.set(ws, { playerId, room: null, name: null });
+  // send initial room list
+  send(ws, { type: 'rooms', rooms: listRooms() });
 
-  socket.on('lobby_list', () => socket.emit('lobby_list', getPublicLobbies()));
+  ws.on('message', (raw) => {
+    let msg;
+    try { msg = JSON.parse(raw); } catch (e) { return; }
+    const meta = clientMeta.get(ws);
 
-  socket.on('create_lobby', (opts = {}, cb) => {
-    try {
-      const name = (opts.name || 'Salon').slice(0, 64);
-      const maxPlayers = Math.max(1, Math.min(32, Number(opts.maxPlayers) || 8));
-      const isPublic = !!opts.isPublic;
-      const passwordHash = hashPassword(opts.password);
-      const id = makeLobbyId();
-      const lobby = { id, name, hostId: socket.id, passwordHash, maxPlayers, public: isPublic, players: new Map() };
-      lobby.players.set(socket.id, { id: socket.id, name: (opts.hostName || 'Host').slice(0, 32), ready: false });
-      lobbies.set(id, lobby);
-      socket.join(id);
-      socket.lobbyId = id;
-      socket.emit('lobby_update', { lobby: { id: lobby.id, name: lobby.name, players: Array.from(lobby.players.values()), maxPlayers: lobby.maxPlayers, public: lobby.public } });
-      io.emit('lobby_list', getPublicLobbies());
-      cb && cb({ ok: true, id });
-    } catch (e) { console.error(e); cb && cb({ ok: false, reason: 'Erreur serveur' }); }
-  });
-
-  socket.on('join_lobby', (data = {}, cb) => {
-    const id = data.id;
-    const lobby = lobbies.get(id);
-    if (!lobby) return cb && cb({ ok: false, reason: 'Salon introuvable' });
-    if (lobby.players.size >= lobby.maxPlayers) return cb && cb({ ok: false, reason: 'Salon plein' });
-    if (lobby.passwordHash && lobby.passwordHash !== hashPassword(data.password || '')) return cb && cb({ ok: false, reason: 'Mot de passe incorrect' });
-    const name = (data.name || 'Player').slice(0, 32);
-    lobby.players.set(socket.id, { id: socket.id, name, ready: false });
-    socket.join(id); socket.lobbyId = id;
-    const meta = { id: lobby.id, name: lobby.name, players: Array.from(lobby.players.values()), maxPlayers: lobby.maxPlayers, public: lobby.public };
-    io.to(id).emit('lobby_update', { lobby: meta });
-    io.emit('lobby_list', getPublicLobbies());
-    cb && cb({ ok: true, lobby: meta });
-  });
-
-  socket.on('leave_lobby', (cb) => {
-    const id = socket.lobbyId;
-    if (!id) return cb && cb({ ok: false });
-    const lobby = lobbies.get(id);
-    if (lobby) {
-      lobby.players.delete(socket.id);
-      socket.leave(id);
-      delete socket.lobbyId;
-      if (lobby.players.size === 0) lobbies.delete(id);
-      else {
-        if (lobby.hostId === socket.id) lobby.hostId = lobby.players.keys().next().value;
-        io.to(id).emit('lobby_update', { lobby: { id: lobby.id, name: lobby.name, players: Array.from(lobby.players.values()), maxPlayers: lobby.maxPlayers, public: lobby.public } });
+    switch (msg.type) {
+      case 'create_room': {
+        const roomId = msg.roomId || uuidv4().slice(0, 8);
+        if (!rooms.has(roomId)) rooms.set(roomId, new Set());
+        send(ws, { type: 'room_created', roomId });
+        // broadcast updated room list
+        for (const c of wss.clients) send(c, { type: 'rooms', rooms: listRooms() });
+        break;
       }
-      io.emit('lobby_list', getPublicLobbies());
-    }
-    cb && cb({ ok: true });
-  });
-
-  socket.on('lobby_chat', ({ text } = {}) => {
-    const id = socket.lobbyId; if (!id) return;
-    const sender = socket.id;
-    io.to(id).emit('lobby_chat', { from: sender, text: String(text || '').slice(0, 400) });
-  });
-
-  socket.on('player_state', (state) => {
-    const id = socket.lobbyId; if (!id) return;
-    // broadcast to other clients in the same lobby
-    socket.to(id).volatile.emit('player_state', { id: socket.id, state });
-  });
-
-  socket.on('player_action', (act) => {
-    const id = socket.lobbyId; if (!id) return;
-    // Basic relay: in a full server authoritative model, validate and apply world updates here
-    io.to(id).emit('player_action', { by: socket.id, action: act });
-  });
-
-  socket.on('disconnect', () => {
-    const id = socket.lobbyId;
-    if (id) {
-      const lobby = lobbies.get(id);
-      if (lobby) {
-        lobby.players.delete(socket.id);
-        if (lobby.players.size === 0) lobbies.delete(id);
-        else {
-          if (lobby.hostId === socket.id) lobby.hostId = lobby.players.keys().next().value;
-          io.to(id).emit('lobby_update', { lobby: { id: lobby.id, name: lobby.name, players: Array.from(lobby.players.values()), maxPlayers: lobby.maxPlayers, public: lobby.public } });
+      case 'join_room': {
+        const roomId = msg.roomId;
+        if (!rooms.has(roomId)) { send(ws, { type: 'error', message: 'Room not found' }); return; }
+        // leave old room
+        if (meta.room && rooms.has(meta.room)) {
+          rooms.get(meta.room).delete(ws);
+          broadcastToRoom(meta.room, { type: 'player_left', playerId: meta.playerId });
         }
-        io.emit('lobby_list', getPublicLobbies());
+        rooms.get(roomId).add(ws);
+        meta.room = roomId;
+        meta.name = msg.name || ('P' + meta.playerId.slice(0,4));
+        send(ws, { type: 'joined', roomId, playerId: meta.playerId, name: meta.name });
+        // notify others
+        broadcastToRoom(roomId, { type: 'player_joined', playerId: meta.playerId, name: meta.name }, ws);
+        // send updated room list to all
+        for (const c of wss.clients) send(c, { type: 'rooms', rooms: listRooms() });
+        break;
       }
+      case 'leave_room': {
+        const r = meta.room;
+        if (r && rooms.has(r)) {
+          rooms.get(r).delete(ws);
+          broadcastToRoom(r, { type: 'player_left', playerId: meta.playerId });
+          meta.room = null;
+        }
+        break;
+      }
+      case 'room_message': {
+        // generic relay inside a room (chat, pos, actions...)
+        if (!meta.room) { send(ws, { type: 'error', message: 'Not in a room' }); return; }
+        const payload = msg.payload || {};
+        payload.playerId = meta.playerId;
+        payload.name = meta.name;
+        broadcastToRoom(meta.room, { type: 'room_message', subtype: msg.subtype, payload }, ws);
+        break;
+      }
+      case 'list_rooms': {
+        send(ws, { type: 'rooms', rooms: listRooms() });
+        break;
+      }
+      default:
+        send(ws, { type: 'error', message: 'Unknown message type' });
     }
+  });
+
+  ws.on('close', () => {
+    const meta = clientMeta.get(ws) || {};
+    if (meta.room && rooms.has(meta.room)) {
+      rooms.get(meta.room).delete(ws);
+      broadcastToRoom(meta.room, { type: 'player_left', playerId: meta.playerId });
+    }
+    clientMeta.delete(ws);
+    // update room list
+    for (const c of wss.clients) send(c, { type: 'rooms', rooms: listRooms() });
   });
 });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log('Multiplayer server listening on', PORT));
+server.listen(PORT, () => console.log('Server listening on', PORT));

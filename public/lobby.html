@@ -1,0 +1,55 @@
+<!-- Minimal lobby UI (drop into the page or open public/lobby.html directly) -->
+<div id="lobby" style="position:fixed;left:12px;top:12px;z-index:6000;background:rgba(10,10,10,0.8);padding:12px;border:2px solid #222;color:#fff;max-width:320px;font-family:system-ui, sans-serif;">
+  <h3 style="margin:0 0 8px 0">Salons</h3>
+  <div id="roomsList" style="max-height:160px;overflow:auto;margin-bottom:8px;"></div>
+  <input id="roomName" placeholder="Nom du salon (optionnel)" style="width:100%;margin-bottom:6px;padding:6px;box-sizing:border-box;"/>
+  <input id="playerName" placeholder="Ton pseudo" style="width:100%;margin-bottom:6px;padding:6px;box-sizing:border-box;"/>
+  <div style="display:flex;gap:8px;">
+    <button id="createRoomBtn" style="flex:1;padding:8px;">Créer</button>
+    <button id="joinRoomBtn" style="flex:1;padding:8px;background:#4caf50;color:#fff;border:0;">Rejoindre</button>
+  </div>
+  <div id="lobbyMsg" style="margin-top:8px;color:#ddd;font-size:13px;"></div>
+</div>
+
+<script>
+  // wiring si network.js est chargé (sinon ouvrir ce fichier standalone)
+  (function () {
+    function $(id) { return document.getElementById(id); }
+    const roomsList = $('roomsList');
+    const rn = $('roomName'), pn = $('playerName'), lbm = $('lobbyMsg');
+
+    function renderRooms(list) {
+      roomsList.innerHTML = '';
+      list.forEach(r => {
+        const el = document.createElement('div');
+        el.textContent = `${r.id} (${r.players})`;
+        el.style.padding = '6px';
+        el.style.borderBottom = '1px solid rgba(255,255,255,0.04)';
+        el.style.cursor = 'pointer';
+        el.onclick = () => { rn.value = r.id; };
+        roomsList.appendChild(el);
+      });
+    }
+
+    document.addEventListener('DOMContentLoaded', () => {
+      if (!window.MP) { lbm.textContent = 'MP: network.js non chargé'; return; }
+      MP.requestRooms();
+      MP.events.addEventListener('rooms', (e) => renderRooms(e.detail));
+      MP.events.addEventListener('joined', (e) => { lbm.textContent = 'Rejoint: ' + e.detail.roomId; });
+      MP.events.addEventListener('room_event', (e) => {
+        const m = e.detail;
+        if (m.type === 'room_message' && m.subtype === 'chat') {
+          // simple affichage dans lobbyMsg (exemple)
+          lbm.textContent = (m.payload && m.payload.text ? (m.payload.name || m.payload.playerId) + ': ' + m.payload.text : JSON.stringify(m.payload));
+        } else if (m.type === 'player_joined') {
+          lbm.textContent = (m.name || m.playerId) + ' a rejoint';
+        } else if (m.type === 'player_left') {
+          lbm.textContent = (m.playerId || '') + ' est parti';
+        }
+      });
+
+      $('createRoomBtn').onclick = () => { MP.createRoom(rn.value || undefined); MP.requestRooms(); };
+      $('joinRoomBtn').onclick = () => { MP.joinRoom(rn.value, pn.value || undefined); };
+    });
+  })();
+</script>
